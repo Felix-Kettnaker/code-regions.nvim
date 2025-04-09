@@ -1,5 +1,6 @@
 -- lua/code-regions/color.lua
 -- Handles color generation and applying background highlights.
+-- Updated: Use line_hl_group for full line background color.
 
 local api = vim.api
 local config = require("code-regions.config")
@@ -82,8 +83,11 @@ end
 local function rgb_to_hex(rgb)
     if not rgb then return nil end
     local function to_hex(c)
-        local hex = string.format("%02x", math.floor(c * 255 + 0.5))
-        return #hex == 1 and "0"..hex or hex -- Ensure two digits
+        local val = math.floor(c * 255 + 0.5)
+        -- Clamp value to 0-255 range
+        val = math.max(0, math.min(255, val))
+        local hex = string.format("%02x", val)
+        return hex -- string.format already ensures two digits
     end
     return "#" .. to_hex(rgb.r) .. to_hex(rgb.g) .. to_hex(rgb.b)
 end
@@ -91,19 +95,19 @@ end
 
 -- Get the background color of the 'Normal' highlight group
 local function get_normal_bg()
-  local ok, normal_hl = pcall(api.nvim_get_hl, 0, { name = "Normal", id = true })
-  if not ok or not normal_hl or not normal_hl.background then
-    -- Fallback if 'Normal' background isn't set (unlikely but possible)
-    -- Attempt to get background from 'NormalNC' or use a default dark/light
-    local bg_ok, normal_nc_hl = pcall(api.nvim_get_hl, 0, { name = "NormalNC", id = true })
-    if bg_ok and normal_nc_hl and normal_nc_hl.background then
-        return string.format("#%06x", normal_nc_hl.background)
+  local ok, normal_hl = pcall(api.nvim_get_hl, 0, { name = "Normal", id = false }) -- Use id=false to get dict
+  -- vim.print("Normal HL:", vim.inspect(normal_hl))
+  if not ok or not normal_hl or not normal_hl.bg then
+    -- Fallback if 'Normal' background isn't set
+    local bg_ok, normal_nc_hl = pcall(api.nvim_get_hl, 0, { name = "NormalNC", id = false })
+    if bg_ok and normal_nc_hl and normal_nc_hl.bg then
+        return string.format("#%06x", normal_nc_hl.bg)
     else
         -- Guess based on Vim's background option
         return vim.o.background == 'dark' and '#202020' or '#F0F0F0'
     end
   end
-  return string.format("#%06x", normal_hl.background)
+  return string.format("#%06x", normal_hl.bg)
 end
 
 -- Generate a background color based on nesting level
@@ -114,6 +118,7 @@ local function generate_color(level)
 
   if not base_bg_hsl then
     -- Fallback if color conversion fails
+    vim.notify("Code Regions: Failed to convert Normal BG to HSL.", vim.log.levels.WARN)
     return config.options.colors and config.options.colors[1] or base_bg_hex
   end
 
@@ -125,10 +130,16 @@ local function generate_color(level)
 
   -- Use specified saturation or base saturation
   local new_s = gen_opts.saturation or base_bg_hsl.s
+  -- Clamp saturation
+  new_s = math.max(0, math.min(1, new_s))
+
 
   local new_hsl = { h = base_bg_hsl.h, s = new_s, l = new_l }
   local new_rgb = hsl_to_rgb(new_hsl)
   local new_hex = rgb_to_hex(new_rgb)
+
+  -- vim.print(string.format("Level %d: Base %s -> HSL %s -> New L %.2f -> New HSL %s -> RGB %s -> Hex %s",
+  --   level, base_bg_hex, vim.inspect(base_bg_hsl), new_l, vim.inspect(new_hsl), vim.inspect(new_rgb), new_hex))
 
   return new_hex or base_bg_hex -- Fallback to base if conversion fails
 end
@@ -161,12 +172,14 @@ function M.define_highlight(level, color_hex)
   -- Define the highlight group
   -- Use guibg for GUI clients and ctermbg for terminals
   -- Note: ctermbg support might be limited depending on terminal capabilities
+  -- Ensure foreground isn't overridden unless necessary
   api.nvim_set_hl(0, group_name, { guibg = color_hex, default = true })
   -- Optional: Add ctermbg support if needed, requires color approximation
   -- local approx_cterm_color = approximate_cterm_color(color_hex)
   -- api.nvim_set_hl(0, group_name, { guibg = color_hex, ctermbg = approx_cterm_color, default = true })
 
   highlight_cache[group_name] = color_hex -- Cache the definition
+  -- vim.print("Defined highlight:", group_name, color_hex)
   return group_name
 end
 
@@ -186,23 +199,23 @@ function M.apply_highlight(bufnr, start_line, end_line, level)
   if not hl_group then return end -- Failed to define highlight
 
   -- Apply the extmark covering the region's lines
-  -- `end_line_idx` is exclusive for set_extmark, so use end_line - 1
-  -- Apply from start_line (0-indexed) to end_line (0-indexed exclusive)
-  -- Exclude the start and end marker lines themselves from coloring
-  local mark_start_line = start_line -- 0-indexed start
-  local mark_end_line = end_line - 1 -- 0-indexed end (exclusive)
+  -- Apply from line *after* start marker to line *before* end marker
+  local mark_start_line = start_line -- 0-indexed start (line *after* the start marker)
+  local mark_end_line = end_line - 1 -- 0-indexed end (line *before* the end marker)
 
-  -- Ensure start is before end
-  if mark_start_line > mark_end_line then return end
+  -- Ensure start is not after end
+  if mark_start_line >= mark_end_line then return end
 
-  -- vim.print("Applying highlight:", hl_group, "to lines", mark_start_line + 1, "-", mark_end_line + 1)
+  -- vim.print(string.format("Applying highlight '%s' (%s) to lines %d-%d (0-indexed)",
+  --   hl_group, color_hex, mark_start_line, mark_end_line - 1)) -- Log end_row which is exclusive
 
+  -- *** CHANGE: Use line_hl_group instead of hl_group ***
   pcall(api.nvim_buf_set_extmark, bufnr, ns_id, mark_start_line, 0, {
-    end_row = mark_end_line,
-    end_col = -1, -- -1 means end of the line
-    hl_group = hl_group,
-    priority = 10, -- Low priority, can be overridden by syntax highlighting etc.
-    strict = false, -- Don't error if range is invalid
+    end_row = mark_end_line, -- end_row is exclusive
+    end_col = -1, -- Apply to whole line width
+    line_hl_group = hl_group, -- Apply highlight to the entire line background
+    priority = 10, -- Low priority
+    strict = false,
   })
 end
 
@@ -210,10 +223,13 @@ end
 function M.clear_highlights(bufnr)
     if not ns_id then
         ns_id = api.nvim_create_namespace("code_regions_hl")
+    else
+        -- Only clear if ns_id actually exists
+        pcall(api.nvim_buf_clear_namespace, bufnr, ns_id, 0, -1)
     end
-    pcall(api.nvim_buf_clear_namespace, bufnr, ns_id, 0, -1)
-    -- Also clear the highlight definition cache as colors might change (e.g., theme switch)
+    -- Clear the highlight definition cache as colors might change (e.g., theme switch)
     highlight_cache = {}
 end
 
 return M
+
