@@ -1,5 +1,7 @@
 -- lua/code-regions/regions.lua
 -- Manages region data, performs buffer scanning, and stores region info.
+-- Updated: Ensure fold options are set correctly and trigger fold updates.
+-- Updated: Temporarily comment out default fold closing for debugging fold levels.
 
 local api = vim.api
 local parser = require("code-regions.parser")
@@ -75,6 +77,13 @@ end
 -- Scan the buffer, find markers, build regions, and apply visuals
 function M.update_buffer(bufnr)
   bufnr = bufnr or api.nvim_get_current_buf()
+  local winid = api.nvim_get_current_win() -- Get current window ID
+
+  -- Check if buffer is valid and loaded before proceeding
+  if not api.nvim_buf_is_valid(bufnr) or not api.nvim_buf_is_loaded(bufnr) then
+      -- vim.notify("Code Regions: Skipping update for invalid/unloaded buffer " .. bufnr, vim.log.levels.DEBUG)
+      return
+  end
 
   -- Check if plugin is enabled and filetype is allowed
    local lang = vim.bo[bufnr].filetype
@@ -82,8 +91,11 @@ function M.update_buffer(bufnr)
       or not lang
       or vim.tbl_contains(config.options.disabled_filetypes, lang) then
      M.clear_buffer(bufnr) -- Clear any existing data/visuals if disabled
+     -- vim.notify("Code Regions: Plugin disabled or filetype '" .. tostring(lang) .. "' blocked.", vim.log.levels.DEBUG)
      return
    end
+
+  -- vim.notify("Code Regions: Updating buffer " .. bufnr, vim.log.levels.DEBUG)
 
   -- 1. Find all markers
   local markers = parser.find_markers(bufnr)
@@ -97,57 +109,82 @@ function M.update_buffer(bufnr)
 
   -- 4. Clear previous visuals
   color.clear_highlights(bufnr)
-  -- Folding is handled by foldexpr, but we might need to trigger an update
-  -- Diagnostics for errors could be added here too
+  -- Folding is handled by foldexpr, but we need to trigger an update
 
   -- 5. Apply new visuals (coloring)
   if config.options.enable_colors then
     for _, region in ipairs(region_data.regions) do
       -- Apply highlight from line *after* start marker to line *before* end marker
-      color.apply_highlight(bufnr, region.start_lnum, region.end_lnum -1, region.level)
+      color.apply_highlight(bufnr, region.start_lnum, region.end_lnum, region.level)
     end
   end
 
   -- 6. Handle folding
   if config.options.enable_folding then
-      -- Ensure fold settings are correct
-      vim.wo[vim.api.nvim_buf_get_winnr(bufnr)].foldmethod = 'expr'
+      -- *** CHANGE: Ensure fold settings are applied correctly ***
+      -- Set buffer-local foldexpr
       vim.bo[bufnr].foldexpr = 'v:lua.require("code-regions.fold").get_fold_level(v:lnum)'
-      vim.wo[vim.api.nvim_buf_get_winnr(bufnr)].foldenable = true
-      -- vim.cmd('normal! zX') -- Update folds in the buffer
-
-      -- Apply default folding state AFTER processing all regions
-      local should_fold_all = config.options.fold_by_default
-      for _, region in ipairs(region_data.regions) do
-          -- Fold if the specific region has fold=true OR if fold_by_default is true
-          if region.fold or should_fold_all then
-              -- Ensure the fold command targets the correct window if multiple are open
-              local current_win = api.nvim_get_current_win()
-              local target_wins = api.nvim_buf_get_windows(bufnr)
-              for _, winid in ipairs(target_wins) do
-                  -- Only close fold in windows where folding is enabled for this plugin
-                  if vim.wo[winid].foldmethod == 'expr' and vim.bo[bufnr].foldexpr == 'v:lua.require("code-regions.fold").get_fold_level(v:lnum)' then
-                      pcall(api.nvim_win_call, winid, function()
-                          -- Need to switch context briefly if not the current window
-                          -- api.nvim_set_current_win(winid) -- Avoid this if possible
-                          -- Use win_execute instead
-                          vim.fn.win_execute(winid, region.start_lnum .. 'foldclose')
-                      end)
-                  end
-              end
-              -- Restore context if changed (though win_execute avoids this)
-              -- api.nvim_set_current_win(current_win)
+      -- Set window-local foldmethod (for the current window viewing this buffer)
+      -- Need to handle multiple windows potentially viewing the same buffer
+      local target_wins = api.nvim_buf_get_windows(bufnr)
+      for _, current_winid in ipairs(target_wins) do
+          -- Check if window is valid before setting options
+          if api.nvim_win_is_valid(current_winid) then
+              vim.wo[current_winid].foldmethod = 'expr'
+              vim.wo[current_winid].foldenable = true -- Ensure folding is enabled in the window
           end
       end
-      -- Force update folds view after potentially closing some
-      vim.cmd('noautocmd normal! zX')
+
+      -- *** CHANGE: Trigger fold update using 'noautocmd normal! zX' ***
+      -- This forces Vim to re-evaluate folds based on the new foldexpr
+      -- Execute in the context of the relevant window(s)
+      for _, current_winid in ipairs(target_wins) do
+          if api.nvim_win_is_valid(current_winid) then
+              -- Use win_execute to run command in specific window context
+              pcall(vim.fn.win_execute, current_winid, 'noautocmd normal! zX')
+          end
+      end
+
+      -- *** TODO: Re-enable default fold closing after confirming levels work ***
+      -- Apply default folding state AFTER processing all regions and updating folds
+      -- local should_fold_all = config.options.fold_by_default
+      -- for _, region in ipairs(region_data.regions) do
+      --     if region.fold or should_fold_all then
+      --         for _, current_winid in ipairs(target_wins) do
+      --             if api.nvim_win_is_valid(current_winid) then
+      --                 -- Check if foldmethod is still expr before trying to close
+      --                 if vim.wo[current_winid].foldmethod == 'expr' then
+      --                      -- vim.print("Closing fold at line", region.start_lnum, "in window", current_winid)
+      --                      pcall(vim.fn.win_execute, current_winid, region.start_lnum .. 'foldclose')
+      --                 end
+      --             end
+      --         end
+      --     end
+      -- end
+      -- Force update folds view again after potentially closing some
+      -- for _, current_winid in ipairs(target_wins) do
+      --     if api.nvim_win_is_valid(current_winid) then
+      --          pcall(vim.fn.win_execute, current_winid, 'noautocmd normal! zX')
+      --     end
+      -- end
+
+
   else
-      -- If folding is disabled, reset fold method
-      local current_foldmethod = vim.bo[bufnr].foldmethod
-      if current_foldmethod == 'expr' and vim.bo[bufnr].foldexpr == 'v:lua.require("code-regions.fold").get_fold_level(v:lnum)' then
-         vim.wo[vim.api.nvim_buf_get_winnr(bufnr)].foldmethod = 'manual' -- Or whatever the default is
-         vim.bo[bufnr].foldexpr = ''
-         vim.cmd('noautocmd normal! zX') -- Update folds view
+      -- If folding is disabled, reset fold method for relevant windows
+      local target_wins = api.nvim_buf_get_windows(bufnr)
+      for _, current_winid in ipairs(target_wins) do
+          if api.nvim_win_is_valid(current_winid) then
+              -- Only reset if *this plugin* set it
+              if vim.bo[bufnr].foldexpr == 'v:lua.require("code-regions.fold").get_fold_level(v:lnum)' then
+                 vim.wo[current_winid].foldmethod = 'manual' -- Or sync with global setting? Manual is safe.
+                 vim.bo[bufnr].foldexpr = '' -- Clear buffer foldexpr too
+                 pcall(vim.fn.win_execute, current_winid, 'noautocmd normal! zX') -- Update folds view
+              end
+          end
+      end
+       -- Ensure buffer foldexpr is cleared if it was ours
+      if vim.bo[bufnr].foldexpr == 'v:lua.require("code-regions.fold").get_fold_level(v:lnum)' then
+          vim.bo[bufnr].foldexpr = ''
       end
   end
 
@@ -158,20 +195,35 @@ end
 -- Clear all data and visuals for a buffer
 function M.clear_buffer(bufnr)
     bufnr = bufnr or api.nvim_get_current_buf()
+    if not api.nvim_buf_is_valid(bufnr) then return end
+
     vim.b[bufnr][buffer_data_key] = nil
     color.clear_highlights(bufnr)
 
     -- Reset folding if it was set by this plugin
-    if vim.bo[bufnr].foldmethod == 'expr' and vim.bo[bufnr].foldexpr == 'v:lua.require("code-regions.fold").get_fold_level(v:lnum)' then
-        vim.wo[vim.api.nvim_buf_get_winnr(bufnr)].foldmethod = 'manual' -- Reset to a default
+    local reset_fold = false
+    if vim.bo[bufnr].foldexpr == 'v:lua.require("code-regions.fold").get_fold_level(v:lnum)' then
         vim.bo[bufnr].foldexpr = ''
-        vim.cmd('noautocmd normal! zX') -- Update folds view
+        reset_fold = true
+    end
+
+    if reset_fold then
+        local target_wins = api.nvim_buf_get_windows(bufnr)
+        for _, current_winid in ipairs(target_wins) do
+            if api.nvim_win_is_valid(current_winid) then
+                if vim.wo[current_winid].foldmethod == 'expr' then
+                    vim.wo[current_winid].foldmethod = 'manual' -- Reset to a default
+                    pcall(vim.fn.win_execute, current_winid, 'noautocmd normal! zX') -- Update folds view
+                end
+            end
+        end
     end
 end
 
 -- Get the processed region data for a buffer
 function M.get_buffer_data(bufnr)
   bufnr = bufnr or api.nvim_get_current_buf()
+  if not api.nvim_buf_is_valid(bufnr) then return nil end
   return vim.b[bufnr][buffer_data_key]
 end
 
